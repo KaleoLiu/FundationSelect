@@ -16,26 +16,35 @@ def extract_data(df, rows, cols):
     return data
 
 
-def FoundSelect(number=3):
+def FoundSelect(number=3, file_path=None):
     fund_types = [
         "國內股票開放型科技類",
         "國內股票開放型一般股票型",
         "國內股票開放型中小型",
     ]
 
-    # Get the current date in the format YYYY-MM-DD
-    current_date = datetime.now().strftime("%Y-%m-%d")
-
-    # Construct the filename with the current date appended
-    file_path = f"FundRanking_{current_date}.xlsx"
-    # file_path = "FundRanking.xlsx"
+    # 如果沒有提供文件路徑，使用當前日期構建文件名
+    if file_path is None:
+        # Get the current date in the format YYYY-MM-DD
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        # Construct the filename with the current date appended
+        file_path = f"FundRanking_{current_date}.xlsx"
     cols_to_extract = slice(0, 2)
     rows_to_extract = slice(0, number)
 
-    # 使用多線程讀取數據
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        data_frames = list(
-            executor.map(read_excel_sheet, [file_path] * len(fund_types), fund_types)
+    # 只讀取「存在」的工作表（富邦 503 時可能缺某幾類）
+    data_frames = []
+    for sheet_name in fund_types:
+        try:
+            df = read_excel_sheet(file_path, sheet_name)
+            data_frames.append(df)
+        except ValueError:
+            # Worksheet named '...' not found，略過該類
+            continue
+
+    if not data_frames:
+        raise FileNotFoundError(
+            f"Excel 中找不到任何排名工作表（{fund_types}），請先成功執行 FundationTaiwan 建檔"
         )
 
     # 提取數據

@@ -38,6 +38,38 @@ def normalize_fund_name(name: str) -> str:
     return s
 
 
+# SITCA 常見基金名稱後綴（括號說明），剝除後可與 Excel 排名名稱對齊
+FUND_NAME_SUFFIX_PATTERN = re.compile(
+    r"\s*[(\（].*?(?:本基金之?配息來源可能為本金|配息來源可能為本金).*?[)\）]?\s*$"
+)
+
+# Excel 排名常見「級別」後綴：A累積型(台幣)、B月配型(台幣)、-A不配息、-I不配息 等，持股與主基金相同
+SHARE_CLASS_SUFFIX_PATTERN = re.compile(
+    r"(?:[ABNI]?(?:累積型|月配型|不配息)|-[AI]不配息)(?:[(\（]台幣[)\）])?\s*$",
+    re.IGNORECASE,
+)
+CURRENCY_SUFFIX_PATTERN = re.compile(r"[(\（]台幣[)\）]\s*$")
+
+
+def fund_name_base(normalized: str) -> str:
+    """剝除 SITCA 常見括號後綴，得到基底名稱（如「台中銀數位時代基金(本基金…)」→「台中銀數位時代基金」）"""
+    return FUND_NAME_SUFFIX_PATTERN.sub("", normalized).strip()
+
+
+def excel_fund_name_to_lookup_base(fund_name: str) -> str:
+    """
+    從 Excel 排名基金名稱推導「主基金名」用於 SITCA 對照。
+    同一主基金之不同級別（A累積型、B月配型、-A不配息、-I不配息）持股相同，對到同一筆 SITCA 即可。
+    例：「台中銀數位時代基金B月配型(台幣)(本基金之配息…」→「台中銀數位時代基金」
+        「台新2000高科技基金-A不配息」→「台新2000高科技基金」
+    """
+    s = normalize_fund_name(fund_name)
+    s = FUND_NAME_SUFFIX_PATTERN.sub("", s).strip()
+    s = CURRENCY_SUFFIX_PATTERN.sub("", s).strip()
+    s = SHARE_CLASS_SUFFIX_PATTERN.sub("", s).strip()
+    return s
+
+
 def format_month_to_yyyymm(month_text: str) -> str:
     """
     將 '2025 年 12 月' 轉成 '202512'
@@ -78,6 +110,10 @@ class SitcaFastClient:
             }
         )
         self._company_map: dict[str, str] | None = None  # '元大投信' -> 'A0005'
+
+    def close(self) -> None:
+        """釋放 Session 連線池，避免爬蟲失敗時連線殘留"""
+        self.session.close()
 
     def _get_with_retry(self, url: str, retries: int = 3, timeout: int = 30):
         last_exc: Exception | None = None
@@ -435,20 +471,54 @@ def process_fundation_fast(
             table = client.fetch_company_month_table(yyyymm, company_value)
             cache[key] = table
 
-        # 先精確，再做名稱正規化匹配（解決 e / ｅ 等差異）
+        # 先精確，再做名稱正規化／主基金名匹配（同主基金不同級別持股相同，對到同一筆 SITCA）
         rows = table.get(fund_name, [])
         if not rows:
-            # 建立 normalized name -> original name 對照
-            norm_map = {normalize_fund_name(n): n for n in table.keys()}
-            if norm_target in norm_map:
-                rows = table.get(norm_map[norm_target], [])
-            else:
-                # fallback：包含關係
-                for n_norm, orig in norm_map.items():
-                    if norm_target in n_norm or n_norm in norm_target:
-                        rows = table.get(orig, [])
+            # 建立對照：正規化名、基底名（剝除「(本基金配息…)」）→ SITCA 原始 key
+            norm_map: dict[str, str] = {}
+            for n in table.keys():
+                n_norm = normalize_fund_name(n)
+                norm_map[n_norm] = n
+                base = fund_name_base(n_norm)
+                if base and base != n_norm:
+                    norm_map[base] = n
+            # 依序嘗試：正規化名、Excel 主基金名（剝除 A累積型/B月配型/-A不配息 等）、前綴、包含
+            lookup_keys = [
+                norm_target,
+                excel_fund_name_to_lookup_base(fund_name),
+            ]
+            for key in lookup_keys:
+                if key and key in norm_map:
+                    rows = table.get(norm_map[key], [])
+                    if rows:
+                        break
+            if not rows:
+                # fallback 1：SITCA 名稱以 Excel 名稱為前綴（或主基金名為前綴）
+                for key in lookup_keys:
+                    if not key:
+                        continue
+                    candidates = [
+                        orig
+                        for n_norm, orig in norm_map.items()
+                        if n_norm.startswith(key)
+                    ]
+                    if candidates:
+                        best = max(candidates, key=lambda o: len(normalize_fund_name(o)))
+                        rows = table.get(best, [])
                         if rows:
                             break
+            if not rows:
+                # fallback 2：包含關係
+                for key in lookup_keys:
+                    if not key:
+                        continue
+                    for n_norm, orig in norm_map.items():
+                        if key in n_norm or n_norm in key:
+                            rows = table.get(orig, [])
+                            if rows:
+                                break
+                    if rows:
+                        break
         # 只留前十筆
         results.append(rows[:10])
 
@@ -483,39 +553,42 @@ def FundationHolding(filename):
     months_text = [formatted_current_month, formatted_previous_month]
 
     client = SitcaFastClient()
-    cache: dict[tuple[str, str], dict[str, list[list[str]]]] = {}
+    try:
+        cache: dict[tuple[str, str], dict[str, list[list[str]]]] = {}
 
-    # 從當日排名檔中選出要處理的基金（預設取前 MAX_FUNDS_PER_RUN 檔）
-    Fundations = FoundSelect(MAX_FUNDS_PER_RUN, file_path=filename)
-    Fundations = Fundations.head(MAX_FUNDS_PER_RUN)
+        # 從當日排名檔中選出要處理的基金（預設取前 MAX_FUNDS_PER_RUN 檔）
+        Fundations = FoundSelect(MAX_FUNDS_PER_RUN, file_path=filename)
+        Fundations = Fundations.head(MAX_FUNDS_PER_RUN)
 
-    # 先把所有需要的 (月份, 公司) key 列出來，並行預抓，後續每支基金只做 dict lookup
-    needed_keys: set[tuple[str, str]] = set()
-    for _, row in Fundations.iterrows():
-        company_value = client.company_name_to_value(row["基金公司"])
-        for mtext in months_text:
-            needed_keys.add((format_month_to_yyyymm(mtext), company_value))
+        # 先把所有需要的 (月份, 公司) key 列出來，並行預抓，後續每支基金只做 dict lookup
+        needed_keys: set[tuple[str, str]] = set()
+        for _, row in Fundations.iterrows():
+            company_value = client.company_name_to_value(row["基金公司"])
+            for mtext in months_text:
+                needed_keys.add((format_month_to_yyyymm(mtext), company_value))
 
-    print(
-        f"預計抓取 {len(needed_keys)} 個 (月份, 公司) 組合，使用 requests（不開瀏覽器）"
-    )
+        print(
+            f"預計抓取 {len(needed_keys)} 個 (月份, 公司) 組合，使用 requests（不開瀏覽器）"
+        )
 
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as ex:
-        futs = {
-            ex.submit(client.fetch_company_month_table, yyyymm, comp): (yyyymm, comp)
-            for (yyyymm, comp) in needed_keys
-        }
-        for fut in as_completed(futs):
-            key = futs[fut]
-            try:
-                cache[key] = fut.result()
-            except Exception as e:
-                print(f"抓取失敗 {key}: {e}")
-                cache[key] = {}
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as ex:
+            futs = {
+                ex.submit(client.fetch_company_month_table, yyyymm, comp): (yyyymm, comp)
+                for (yyyymm, comp) in needed_keys
+            }
+            for fut in as_completed(futs):
+                key = futs[fut]
+                try:
+                    cache[key] = fut.result()
+                except Exception as e:
+                    print(f"抓取失敗 {key}: {e}")
+                    cache[key] = {}
 
-    # 寫入每支基金
-    for fund_row in Fundations.iterrows():
-        process_fundation_fast(fund_row, months_text, client, cache, filename)
+        # 寫入每支基金
+        for fund_row in Fundations.iterrows():
+            process_fundation_fast(fund_row, months_text, client, cache, filename)
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":

@@ -1,17 +1,14 @@
-import requests
+import os
+import ssl
+import threading
+import time
+from datetime import datetime
+
 import openpyxl
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.support.ui import Select
-from selenium.webdriver.firefox.service import Service
-from webdriver_manager.firefox import GeckoDriverManager
-import threading
-from datetime import datetime
-import os
-import json
-import traceback
+from requests.adapters import HTTPAdapter
 
 try:
     import certifi
@@ -19,137 +16,69 @@ except ImportError:
     certifi = None
 
 
-def get_data(url, fund_type):
-    # 配置Selenium
-    # geckodriver_path = "/geckodriver"
-    geckodriver_path = "/opt/homebrew/bin/geckodriver"
+# Fubon「基金類型」頁面基底 URL
+BASE_URL = "https://fubon-ebrokerdj.fbs.com.tw"
+FUND_TYPE_PATHS = {
+    # 這些路徑是從原本 Selenium 選單觀察得來，改成直接走 requests 加速
+    "國內股票開放型科技類": "/w/wq/wq02_ET001001_801.djhtm",
+    "國內股票開放型中小型": "/w/wq/wq02_ET001004_801.djhtm",
+    "國內股票開放型一般股票型": "/w/wq/wq02_ET001005_801.djhtm",
+}
 
-    options = Options()
-    options.add_argument("--disable-notifications")
-    options.add_argument("--headless")
-    # 使用 Firefox 瀏覽器與指定的選項
-    service = Service(executable_path=geckodriver_path)
-    # service = Service(GeckoDriverManager().install())
-    browser = webdriver.Firefox(service=service, options=options)
-    browser.get(url)
 
-    # 選擇下拉列表中的基金類型
-    select_element = Select(browser.find_element("name", "selTID"))
-    select_element.select_by_visible_text(fund_type)
+def _create_secure_session() -> requests.Session:
+    """建立帶安全 SSL context 的 requests Session（避免 Python 3.13 嚴格 SKI 問題）"""
 
-    fund_type_url = browser.current_url
+    def create_secure_ssl_context():
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if certifi:
+            ctx.load_verify_locations(certifi.where())
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.check_hostname = True
+        return ctx
 
-    # #region agent log
-    log_path = "/Users/server-macmini/Documents/FundationSelect/.cursor/debug.log"
-    cert_bundle = None
-    try:
-        cert_bundle = certifi.where() if certifi else None
-        with open(log_path, "a") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A",
-                        "location": "FundationTaiwan.py:41",
-                        "message": "certifi check",
-                        "data": {
-                            "certifi_available": certifi is not None,
-                            "cert_bundle": cert_bundle,
-                            "url": fund_type_url,
-                        },
-                        "timestamp": int(datetime.now().timestamp() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception as e:
-        pass
-    # #endregion
+    class SecureHTTPAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            kwargs["ssl_context"] = create_secure_ssl_context()
+            return super().init_poolmanager(*args, **kwargs)
 
-    # 使用 requests 库獲取頁面內容
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36"
-    }
     session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+        }
+    )
+    secure_adapter = SecureHTTPAdapter()
+    session.mount("https://", secure_adapter)
+    return session
 
-    # #region agent log
-    try:
-        with open(log_path, "a") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A,B,C,D,E",
-                        "location": "FundationTaiwan.py:47",
-                        "message": "before requests.get",
-                        "data": {
-                            "url": fund_type_url,
-                            "verify_default": session.verify,
-                        },
-                        "timestamp": int(datetime.now().timestamp() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception as e:
-        pass
-    # #endregion
 
-    try:
-        response = session.get(fund_type_url, headers=headers)
-        # #region agent log
+def get_data(fund_type: str, retries: int = 3) -> str:
+    """使用 requests 直接抓取指定基金類型的績效排行頁面 HTML；503/502/504 時自動重試"""
+    if fund_type not in FUND_TYPE_PATHS:
+        raise ValueError(f"未知的 fund_type: {fund_type}")
+
+    fund_type_url = BASE_URL + FUND_TYPE_PATHS[fund_type]
+    last_exc = None
+    for attempt in range(retries):
+        session = _create_secure_session()
         try:
-            with open(log_path, "a") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A,B,C,D,E",
-                            "location": "FundationTaiwan.py:54",
-                            "message": "requests.get success",
-                            "data": {"status_code": response.status_code},
-                            "timestamp": int(datetime.now().timestamp() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
+            resp = session.get(fund_type_url, timeout=30)
+            if resp.status_code in (502, 503, 504) and attempt < retries - 1:
+                time.sleep(2 + attempt * 2)  # 2s, 4s, 6s
+                continue
+            resp.raise_for_status()
+            return resp.text
         except Exception as e:
-            pass
-        # #endregion
-    except requests.exceptions.SSLError as e:
-        # #region agent log
-        try:
-            with open(log_path, "a") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A,B,C,D,E",
-                            "location": "FundationTaiwan.py:61",
-                            "message": "SSL error caught",
-                            "data": {
-                                "error_type": type(e).__name__,
-                                "error_msg": str(e),
-                                "cert_bundle": cert_bundle if certifi else None,
-                            },
-                            "timestamp": int(datetime.now().timestamp() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception as log_err:
-            pass
-        # #endregion
-        raise
-
-    # 關閉瀏覽器
-    browser.quit()
-
-    return response.text
+            last_exc = e
+            if attempt < retries - 1:
+                time.sleep(2 + attempt * 2)
+        finally:
+            session.close()
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"抓取失敗: {fund_type}")
 
 
 def parse_table(html):
@@ -208,10 +137,8 @@ def write_to_excel(data, sheet_name, File_name):
 
 # FundationGet函數，這裡我們將其設計為一個可以接受參數的函數，方便多線程處理
 def FundationGet(fund_type, File_name):
-    url = "https://fubon-ebrokerdj.fbs.com.tw/w/wq/wq02.djhtm"
-
     # 獲取網頁內容
-    html = get_data(url, fund_type)
+    html = get_data(fund_type)
     # 解析表格並獲取數據
     data = parse_table(html)
     # 將數據寫入Excel
