@@ -26,5 +26,5 @@ geckodriver.log
 sitca_fast_response.html
 wq02_base.html
 
-# Excel 產出可選：若不想追蹤可取消註解
-# FundRanking_*.xlsx
+# Excel 產出（不納入版控，每次執行會重新產生）
+FundRanking_*.xlsx
