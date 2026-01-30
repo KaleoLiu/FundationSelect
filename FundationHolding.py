@@ -1,75 +1,239 @@
 import os
-from datetime import datetime
-import time
-import requests
-import pandas as pd
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support.ui import Select
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException
-from webdriver_manager.firefox import GeckoDriverManager
-from selenium.webdriver.firefox.service import Service
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from FoundationSelect import FoundSelect
-import openpyxl
-from threading import Thread
-from datetime import date, timedelta
-import calendar
-from concurrent.futures import ThreadPoolExecutor
+import re
+from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import openpyxl
+import requests
+from bs4 import BeautifulSoup
+import unicodedata
 
-# 獲取基金持股連結
-def get_fund_index_link(url):
-    # 配置Selenium
-    # geckodriver_path = "/geckodriver"
-    geckodriver_path = "/opt/homebrew/bin/geckodriver"
+from FoundationSelect import FoundSelect
 
-    options = Options()
-    options.add_argument("--disable-notifications")
-    options.add_argument("--headless")
-    # 使用 Firefox 瀏覽器與指定的選項
-    service = Service(executable_path=geckodriver_path)
-    # service = Service(GeckoDriverManager().install())
-    browser = webdriver.Firefox(service=service, options=options)
-    browser.get(url)
 
-    try:
-        # 等待“月前十大”連結出現
-        wait = WebDriverWait(browser, 10)
-        link = wait.until(
-            EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, "月前十大"))
+SITCA_URL = "https://www.sitca.org.tw/ROC/Industry/IN2629.aspx?pid=IN22601_04"
+DEFAULT_CLASS_VALUE = "AA1"  # 類型預設 AA1（即使下拉 disabled）
+
+# 一次處理幾檔基金（由 FundRanking_* 中前幾名決定）
+MAX_FUNDS_PER_RUN = 10
+
+# 同一時間最多對 SITCA 發出幾個請求
+MAX_CONCURRENT_REQUESTS = 6
+
+
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def normalize_fund_name(name: str) -> str:
+    """
+    將基金名稱做寬鬆正規化：
+    - 去除前後空白、連續空白
+    - 全形/半形統一（例如 'ｅ' -> 'e'）
+    - 移除所有空白
+    """
+    s = _clean(name)
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace(" ", "")
+    return s
+
+
+def format_month_to_yyyymm(month_text: str) -> str:
+    """
+    將 '2025 年 12 月' 轉成 '202512'
+    """
+    m = re.search(r"(\d{4})\s*年\s*(\d{2})\s*月", month_text)
+    if not m:
+        raise ValueError(f"Unsupported month format: {month_text}")
+    return f"{m.group(1)}{m.group(2)}"
+
+
+def parse_company_code_from_excel_text(company_text: str) -> str:
+    """
+    '元大投信' -> 嘗試在 SITCA 公司下拉中找對應 value（例如 A0005）
+    """
+    return _clean(company_text)
+
+
+def get_hidden_inputs(soup: BeautifulSoup) -> dict[str, str]:
+    hidden_names = ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]
+    data: dict[str, str] = {}
+    for name in hidden_names:
+        el = soup.find("input", {"name": name})
+        if el and el.get("value") is not None:
+            data[name] = el["value"]
+    missing = [n for n in hidden_names if n not in data]
+    if missing:
+        raise RuntimeError(f"缺少必要 hidden 欄位: {missing}")
+    return data
+
+
+class SitcaFastClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+            }
         )
+        self._company_map: dict[str, str] | None = None  # '元大投信' -> 'A0005'
 
-        # 點擊該連結
-        link.click()
+    def _get_with_retry(self, url: str, retries: int = 3, timeout: int = 30):
+        last_exc: Exception | None = None
+        for _ in range(retries):
+            try:
+                resp = self.session.get(url, timeout=timeout)
+                resp.raise_for_status()
+                return resp
+            except Exception as e:
+                last_exc = e
+        assert last_exc is not None
+        raise last_exc
 
-        # 等待新頁面加載
-        wait.until(EC.number_of_windows_to_be(2))
-        # 切換到新打開的窗口
-        browser.switch_to.window(browser.window_handles[-1])
+    def _post_with_retry(
+        self, url: str, data: dict[str, str], retries: int = 3, timeout: int = 30
+    ):
+        last_exc: Exception | None = None
+        for _ in range(retries):
+            try:
+                resp = self.session.post(url, data=data, timeout=timeout)
+                resp.raise_for_status()
+                return resp
+            except Exception as e:
+                last_exc = e
+        assert last_exc is not None
+        raise last_exc
 
-        # 等待新頁面完全加載
-        time.sleep(3)
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    def _get_company_map(self) -> dict[str, str]:
+        if self._company_map is not None:
+            return self._company_map
 
-        # 返回新頁面的URL
-        return browser.current_url
-    except (TimeoutException, NoSuchElementException) as e:
-        print("Error occurred: ", e)
-        return None
-    finally:
-        # 關閉瀏覽器
-        browser.quit()
+        r = self._get_with_retry(SITCA_URL, retries=3, timeout=30)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        select = soup.find("select", {"id": "ctl00_ContentPlaceHolder1_ddlQ_Comid"})
+        if not select:
+            raise RuntimeError(
+                "找不到公司下拉選單 ctl00_ContentPlaceHolder1_ddlQ_Comid"
+            )
+
+        mapping: dict[str, str] = {}
+        for opt in select.find_all("option"):
+            value = (opt.get("value") or "").strip()
+            text = _clean(opt.get_text())
+            # text 可能是 "A0005 元大投信"，取最後的公司名
+            name = _clean(re.sub(r"^A\d{4}\s*", "", text))
+            if value and name:
+                mapping[name] = value
+
+        if not mapping:
+            raise RuntimeError("公司下拉選單解析失敗（mapping 為空）")
+
+        self._company_map = mapping
+        return mapping
+
+    def company_name_to_value(self, company_name: str) -> str:
+        company_name = parse_company_code_from_excel_text(company_name)
+        m = self._get_company_map()
+        if company_name in m:
+            return m[company_name]
+        # 寬鬆匹配：用包含判斷
+        for k, v in m.items():
+            if company_name in k or k in company_name:
+                return v
+        raise KeyError(f"找不到投信公司對應代碼: {company_name}")
+
+    def fetch_company_month_table(
+        self, yyyymm: str, company_value: str
+    ) -> dict[str, list[list[str]]]:
+        """
+        取得某個月份 + 某家公司（A0005）下的整張「月前十大」資料，
+        回傳：fund_name -> rows
+        rows 每列為：
+            [名次, 標的種類, 標的代號, 標的名稱, 金額, 擔保機構, 次順位債券, 受益權單位數, 占比]
+        """
+        # 1) GET 取得 hidden
+        r = self._get_with_retry(SITCA_URL, retries=3, timeout=30)
+        soup = BeautifulSoup(r.text, "html.parser")
+        hidden = get_hidden_inputs(soup)
+
+        # 2a) 先 postback 年月
+        payload_ym: dict[str, str] = {
+            **hidden,
+            "__EVENTTARGET": "ctl00$ContentPlaceHolder1$ddlQ_YM",
+            "__EVENTARGUMENT": "",
+            "ctl00$ContentPlaceHolder1$ddlQ_YM": yyyymm,
+            "ctl00$ContentPlaceHolder1$ddlQ_Class": DEFAULT_CLASS_VALUE,
+        }
+        r_ym = self._post_with_retry(SITCA_URL, data=payload_ym, retries=3, timeout=30)
+        soup_ym = BeautifulSoup(r_ym.text, "html.parser")
+        hidden2 = get_hidden_inputs(soup_ym)
+
+        # 2b) 查詢（公司）
+        payload_query: dict[str, str] = {
+            **hidden2,
+            "__EVENTTARGET": "",
+            "__EVENTARGUMENT": "",
+            "ctl00$ContentPlaceHolder1$ddlQ_YM": yyyymm,
+            "ctl00$ContentPlaceHolder1$rdo1": "rbComid",
+            "ctl00$ContentPlaceHolder1$ddlQ_Comid": company_value,
+            "ctl00$ContentPlaceHolder1$ddlQ_Class": DEFAULT_CLASS_VALUE,
+            "ctl00$ContentPlaceHolder1$BtnQuery": "查詢",
+        }
+        r2 = self._post_with_retry(SITCA_URL, data=payload_query, retries=3, timeout=30)
+        soup2 = BeautifulSoup(r2.text, "html.parser")
+
+        # 3) 找結果 table（用純文字判斷避免 HTML 不嚴謹）
+        result_table = None
+        for table in soup2.find_all("table"):
+            text = table.get_text(" ", strip=True)
+            if ("基金名稱" in text) and ("標的種類" in text) and ("名次" in text):
+                result_table = table
+                break
+        if not result_table:
+            raise RuntimeError(
+                "找不到結果表格（未找到含 基金名稱/標的種類/名次 的 table）"
+            )
+
+        fund_rows: dict[str, list[list[str]]] = {}
+        current_fund: str | None = None
+
+        for tr in result_table.find_all("tr")[1:]:
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+
+            # row 可能含基金名稱（rowspan=10）
+            if len(tds) >= 10:
+                current_fund = _clean(tds[0].get_text())
+                cells = tds[1:]
+            else:
+                cells = tds
+
+            if not current_fund:
+                continue
+
+            # cells 預期至少 9 欄：名次..占比
+            if len(cells) < 9:
+                continue
+
+            row = [_clean(c.get_text()) for c in cells[:9]]
+            fund_rows.setdefault(current_fund, []).append(row)
+
+        return fund_rows
 
 
 # 最近一個月份：數據寫入Excel
+def truncate_sheet_name(sheet_name, max_length=31):
+    if len(sheet_name) <= max_length:
+        return sheet_name
+    return sheet_name[:max_length]
+
+
 def write_recrrent_month_excel(data, sheet_name, header, filename):
     workbook = openpyxl.load_workbook(filename)
+    sheet_name = truncate_sheet_name(sheet_name)
     if sheet_name in workbook.sheetnames:
         del workbook[sheet_name]
     worksheet = workbook.create_sheet(title=sheet_name)
@@ -88,6 +252,7 @@ def write_recrrent_month_excel(data, sheet_name, header, filename):
 # 最近兩個月份：數據寫入Excel
 def write_previous_month_excel(data, sheet_name, header, filename):
     workbook = openpyxl.load_workbook(filename)
+    sheet_name = truncate_sheet_name(sheet_name)
     worksheet = workbook[sheet_name]
 
     # Add description to the first cell in the first row
@@ -108,6 +273,7 @@ def write_previous_month_excel(data, sheet_name, header, filename):
 # 兩個月份比較：數據寫入Excel
 def write_compare_fundation_excel(increase, new, delete, sheet_name, filename):
     workbook = openpyxl.load_workbook(filename)
+    sheet_name = truncate_sheet_name(sheet_name)
     worksheet = workbook[sheet_name]
 
     # 從第15行第1列開始寫入多行數據
@@ -127,101 +293,42 @@ def write_compare_fundation_excel(increase, new, delete, sheet_name, filename):
     workbook.save(filename)
 
 
-# 選擇部分文字的選項
-def select_by_partial_text(select_element, partial_text):
-    found = False
-    for option in select_element.options:
-        if partial_text in option.text:
-            select_element.select_by_visible_text(option.text)
-            found = True
-            return
-    if not found:
-        raise NoSuchElementException(
-            f"No option with partial text '{partial_text}' found in dropdown."
-        )
+def compare_fundation_in_different_months(recent_months, previous_months):
+    # recent/previous: list rows; each row [名次, 標的種類, 標的代號, 標的名稱, 金額, ...]
+    re_month_arrey = [[row[2], row[3], row[4]] for row in recent_months]
+    pr_month_arrey = [[row[2], row[3], row[4]] for row in previous_months]
 
+    # 增加持股
+    increase_fundations = ["增加持股", ["標的代號", "標的名稱", "金額", "差額"]]
+    re_map = {r[0]: r for r in re_month_arrey if r and r[0]}
+    for pr in pr_month_arrey:
+        if not pr or not pr[0]:
+            continue
+        if pr[0] in re_map:
+            re_row = re_map[pr[0]]
+            try:
+                pr_val = float((pr[2] or "0").replace(",", ""))
+                re_val = float((re_row[2] or "0").replace(",", ""))
+            except Exception:
+                continue
+            if pr_val <= re_val:
+                increase_fundations.append([pr[0], pr[1], pr[2], re_val - pr_val])
 
-# 主要函數
-def search_each_fundation(month, Fundation_name, Fundation_company, fund_index_link):
-    print("Fundation_name:", Fundation_name)
-    print("Fundation_company:", Fundation_company)
-    # 配置Selenium
-    # geckodriver_path = "/geckodriver"
-    geckodriver_path = "/opt/homebrew/bin/geckodriver"
+    # 新增持股
+    new_fundations = ["新增持股", ["標的代號", "標的名稱", "金額"]]
+    pr_codes = {r[0] for r in pr_month_arrey if r and r[0]}
+    for re_row in re_month_arrey:
+        if re_row and re_row[0] and re_row[0] not in pr_codes:
+            new_fundations.append(re_row)
 
-    options = Options()
-    options.add_argument("--disable-notifications")
-    options.add_argument("--headless")
-    # 使用 Firefox 瀏覽器與指定的選項
-    service = Service(executable_path=geckodriver_path)
-    browser = webdriver.Firefox(service=service, options=options)
-    browser.get(fund_index_link)
+    # 剔除持股
+    delete_fundations = ["剔除持股", ["標的代號", "標的名稱", "金額"]]
+    re_codes = {r[0] for r in re_month_arrey if r and r[0]}
+    for pr in pr_month_arrey:
+        if pr and pr[0] and pr[0] not in re_codes:
+            delete_fundations.append(pr)
 
-    wait = WebDriverWait(browser, 10)
-
-    try:
-        # 選擇月份
-        print("1:月份")
-        wait = WebDriverWait(browser, 10)
-        dropdown_element_time = wait.until(
-            EC.element_to_be_clickable((By.ID, "ctl00_ContentPlaceHolder1_ddlQ_YM"))
-        )
-        time.sleep(3)
-        dropdown = Select(dropdown_element_time)
-        select_by_partial_text(dropdown, month)
-
-        # 選擇基金
-        print("2：基金")
-        wait = WebDriverWait(browser, 10)
-        dropdown_element = wait.until(
-            EC.element_to_be_clickable((By.ID, "ctl00_ContentPlaceHolder1_ddlQ_Comid"))
-        )
-        time.sleep(3)
-        dropdown = Select(dropdown_element)
-        select_by_partial_text(dropdown, Fundation_company)
-
-        # 點擊搜尋按鈕
-        print("3：按鈕")
-        wait = WebDriverWait(browser, 20)
-        button = wait.until(
-            EC.element_to_be_clickable((By.ID, "ctl00_ContentPlaceHolder1_BtnQuery"))
-        )
-        button.click()
-        time.sleep(3)
-
-        # 定位表格並提取目標行
-        print("4提取基金名")
-        grab_rows, grabbed_rows = False, 0
-        search_text = Fundation_name.split("基金")[0] + "基金"
-        print(search_text)
-
-        # 更改這裡，一次性選取所有需要的<td>元素
-        table_cells = browser.find_elements("xpath", "//tr")
-        table_data = []
-
-        for row in table_cells:
-            cells = row.find_elements("xpath", ".//td")
-            row_data = [cell.text for cell in cells]
-
-            if search_text in row_data[0][0:20]:
-                print("Sucess!!!!!")
-                grab_rows = True
-
-            if grab_rows and grabbed_rows < 10:
-                if grabbed_rows == 0:
-                    del row_data[0]  # 刪除第一行第一列的元素
-                table_data.append(row_data)
-                grabbed_rows += 1
-                if grabbed_rows >= 10:
-                    break
-
-        # 將表格數據作為返回值
-        return table_data
-    except NoSuchElementException as e:
-        print("Error creating")
-    finally:
-        browser.quit()
-        print("END PUBLIC")
+    return increase_fundations, new_fundations, delete_fundations
 
 
 def calculate_business_days_in_month(year, month):
@@ -295,93 +402,18 @@ def get_current_and_previous_months(today):
     return formatted_previous_1month, formatted_previous_2month
 
 
-def compare_fundation_in_different_months(recent_months, previous_months):
-    re_month_arrey = [[row[2], row[3], row[4]] for row in recent_months]
-    pr_month_arrey = [[row[2], row[3], row[4]] for row in previous_months]
+def process_fundation_fast(
+    fund_row,
+    months_text: list[str],
+    client: SitcaFastClient,
+    cache: dict[tuple[str, str], dict[str, list[list[str]]]],
+    filename: str,
+):
+    fund_name = fund_row[1]["基金名稱"]
+    norm_target = normalize_fund_name(fund_name)
+    fund_company_name = fund_row[1]["基金公司"]
+    company_value = client.company_name_to_value(fund_company_name)
 
-    # 初始化一個新的陣列來存儲匹配的項目
-    increase_fundations = []
-    increase_fundations.append("增加持股")
-    pr = [
-        "標的代號",
-        "標的名稱",
-        "金額",
-        "差額",
-    ]
-    increase_fundations.append(pr)
-    for pr in pr_month_arrey:
-        for re in re_month_arrey:
-            if pr[0] == re[0] and pr[2] <= re[2]:
-                # 将字符串转换为浮点数后进行差值计算
-                pr_diff = float(re[2].replace(",", "")) - float(pr[2].replace(",", ""))
-                pr.append(pr_diff)  # 将差值追加到pr列表中
-                increase_fundations.append(pr)
-
-    # 初始化一個新的陣列來存儲匹配的項目
-    new_fundations = []
-    new_fundations.append("新增持股")
-    pr = [
-        "標的代號",
-        "標的名稱",
-        "金額",
-    ]
-    new_fundations.append(pr)
-    for re in re_month_arrey:
-        found = False  # 設置一個標誌來追踪是否找到匹配項目
-        for pr in pr_month_arrey:
-            if re[0] == pr[0]:
-                found = True  # 找到匹配項目時，將標誌設為True
-                break  # 如果找到匹配項目，則中斷內層迴圈
-        if not found:  # 如果未找到匹配項目，且滿足其他條件
-            new_fundations.append(re)  # 則添加到新陣列中
-
-    # 初始化一個新的陣列來存儲匹配的項目
-    delete_fundations = []
-    delete_fundations.append("剔除持股")
-    pr = [
-        "標的代號",
-        "標的名稱",
-        "金額",
-    ]
-    delete_fundations.append(pr)
-    for pr in pr_month_arrey:
-        found = False  # 設置一個標誌來追踪是否找到匹配項目
-        for re in re_month_arrey:
-            if pr[0] == re[0]:
-                found = True  # 找到匹配項目時，將標誌設為True
-                break  # 如果找到匹配項目，則中斷內層迴圈
-        if not found:  # 如果未找到匹配項目，且滿足其他條件
-            delete_fundations.append(pr)  # 則添加到新陣列中
-
-    # 回覆“增持股票”.“新增股票”.“剔除股票”
-    return increase_fundations, new_fundations, delete_fundations
-
-
-def process_fundation(Fundation, months, fund_monthly_link, filename, delay):
-    results = []
-    threads = []
-    time.sleep(delay)  # 在任务执行前增加延迟
-    # 使用多執行緒運行main函數並收集返回值
-    for month in months:
-        thread = Thread(
-            target=lambda q, arg1, arg2, arg3, arg4: q.append(
-                search_each_fundation(arg1, arg2, arg3, arg4)
-            ),
-            args=(
-                results,
-                month,
-                Fundation[1]["基金名稱"],
-                Fundation[1]["基金公司"],
-                fund＿monthly_link,
-            ),
-        )
-        threads.append(thread)
-        thread.start()
-        time.sleep(5)
-    for thread in threads:
-        thread.join()
-
-    # 標頭資訊
     headers = [
         "名次",
         "標的種類",
@@ -393,127 +425,97 @@ def process_fundation(Fundation, months, fund_monthly_link, filename, delay):
         "受益權單位數",
         "基金淨資產價值之比例",
     ]
-    # 先寫入最新月份資料再寫入前一月份資料
-    write_recrrent_month_excel(results[0], Fundation[1]["基金名稱"], headers, filename)
-    write_previous_month_excel(results[1], Fundation[1]["基金名稱"], headers, filename)
 
-    increase = []
-    new = []
-    delete = []
+    results: list[list[list[str]]] = []
+    for mtext in months_text:
+        yyyymm = format_month_to_yyyymm(mtext)
+        key = (yyyymm, company_value)
+        table = cache.get(key)
+        if table is None:
+            table = client.fetch_company_month_table(yyyymm, company_value)
+            cache[key] = table
+
+        # 先精確，再做名稱正規化匹配（解決 e / ｅ 等差異）
+        rows = table.get(fund_name, [])
+        if not rows:
+            # 建立 normalized name -> original name 對照
+            norm_map = {normalize_fund_name(n): n for n in table.keys()}
+            if norm_target in norm_map:
+                rows = table.get(norm_map[norm_target], [])
+            else:
+                # fallback：包含關係
+                for n_norm, orig in norm_map.items():
+                    if norm_target in n_norm or n_norm in norm_target:
+                        rows = table.get(orig, [])
+                        if rows:
+                            break
+        # 只留前十筆
+        results.append(rows[:10])
+
+    # 保護：確保兩個月份都有資料結構
+    current_rows = results[0] if len(results) > 0 else []
+    prev_rows = results[1] if len(results) > 1 else []
+
+    write_recrrent_month_excel(current_rows, fund_name, headers, filename)
+    write_previous_month_excel(prev_rows, fund_name, headers, filename)
+
     increase, new, delete = compare_fundation_in_different_months(
-        results[0], results[1]
+        current_rows, prev_rows
     )
-    write_compare_fundation_excel(
-        increase, new, delete, Fundation[1]["基金名稱"], filename
-    )
-    print("/////////////")
+    write_compare_fundation_excel(increase, new, delete, fund_name, filename)
 
 
 def FundationHolding(filename):
-
     today = date.today()
     print("今天日期:", today)
-    # 獲取當前月份和前一個月份
+
+    if not os.path.exists(filename):
+        raise FileNotFoundError(
+            f"文件不存在: {filename}（請先執行 FundationTaiwan 建檔）"
+        )
+
     formatted_current_month, formatted_previous_month = get_current_and_previous_months(
         today
     )
     print("當前月份:", formatted_current_month)
     print("前一個月份:", formatted_previous_month)
 
-    # 抓取基金持股連結
-    url = "https://www.sitca.org.tw/ROC/Industry/IN2002.aspx?PGMID=IN0202"
-    fund＿monthly_link = get_fund_index_link(url)
-    print(fund＿monthly_link)
+    months_text = [formatted_current_month, formatted_previous_month]
 
-    # 獲取基金選擇
-    Fundations = FoundSelect(5)
-    print(Fundations["基金名稱"])
-    months = [formatted_current_month, formatted_previous_month]
-    # 確保 threads 和 results 列表被正確初始化
-    threads = []
-    max_workers = 3  # 同時允許的最大執行緒數量
-    delay = 2  # 初始延迟
-    delay_increment = 7  # 每个任务之间增加的延迟
-    if False:
-        for Fundation in Fundations.iterrows():
-            results = []
-            # 使用多執行緒運行main函數並收集返回值
-            for month in months:
-                thread = Thread(
-                    target=lambda q, arg1, arg2, arg3, arg4: q.append(
-                        search_each_fundation(arg1, arg2, arg3, arg4)
-                    ),
-                    args=(
-                        results,
-                        month,
-                        Fundation[1]["基金名稱"],
-                        Fundation[1]["基金公司"],
-                        fund＿monthly_link,
-                    ),
-                )
-                threads.append(thread)
-                thread.start()
-            for thread in threads:
-                thread.join()
+    client = SitcaFastClient()
+    cache: dict[tuple[str, str], dict[str, list[list[str]]]] = {}
 
-            # 標頭資訊
-            headers = [
-                "名次",
-                "標的種類",
-                "標的代號",
-                "標的名稱",
-                "金額",
-                "擔保機構",
-                "次順位債券",
-                "受益權單位數",
-                "基金淨資產價值之比例",
-            ]
-            # 先寫入最新月份資料再寫入前一月份資料
-            write_recrrent_month_excel(
-                results[0], Fundation[1]["基金名稱"], headers, filename
-            )
-            write_previous_month_excel(
-                results[1], Fundation[1]["基金名稱"], headers, filename
-            )
+    # 從當日排名檔中選出要處理的基金（預設取前 MAX_FUNDS_PER_RUN 檔）
+    Fundations = FoundSelect(MAX_FUNDS_PER_RUN, file_path=filename)
+    Fundations = Fundations.head(MAX_FUNDS_PER_RUN)
 
-            increase = []
-            new = []
-            delete = []
-            increase, new, delete = compare_fundation_in_different_months(
-                results[0], results[1]
-            )
-            write_compare_fundation_excel(
-                increase, new, delete, Fundation[1]["基金名稱"], filename
-            )
-            print("/////////////")
-    else:
-        try:
-            # 使用ThreadPoolExecutor创建线程池
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                for index, Fundation in enumerate(Fundations.iterrows()):
-                    future = executor.submit(
-                        process_fundation,
-                        Fundation,
-                        months,
-                        fund_monthly_link,
-                        filename,
-                        delay + index * delay_increment,
-                    )
-                    futures.append(future)
+    # 先把所有需要的 (月份, 公司) key 列出來，並行預抓，後續每支基金只做 dict lookup
+    needed_keys: set[tuple[str, str]] = set()
+    for _, row in Fundations.iterrows():
+        company_value = client.company_name_to_value(row["基金公司"])
+        for mtext in months_text:
+            needed_keys.add((format_month_to_yyyymm(mtext), company_value))
 
-                # 等待所有任务完成，可以在这里获取每个任务的结果
-                for future in futures:
-                    try:
-                        result = future.result()  # 获取结果
-                        # 处理结果
-                    except Exception as e:
-                        print(f"处理过程中发生错误: {e}")
-                        print(f"Error result: {result}")
+    print(
+        f"預計抓取 {len(needed_keys)} 個 (月份, 公司) 組合，使用 requests（不開瀏覽器）"
+    )
 
-        except KeyboardInterrupt:
-            print("程序被用户中断")
-            # 在这里添加任何清理或保存工作的代码
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as ex:
+        futs = {
+            ex.submit(client.fetch_company_month_table, yyyymm, comp): (yyyymm, comp)
+            for (yyyymm, comp) in needed_keys
+        }
+        for fut in as_completed(futs):
+            key = futs[fut]
+            try:
+                cache[key] = fut.result()
+            except Exception as e:
+                print(f"抓取失敗 {key}: {e}")
+                cache[key] = {}
+
+    # 寫入每支基金
+    for fund_row in Fundations.iterrows():
+        process_fundation_fast(fund_row, months_text, client, cache, filename)
 
 
 if __name__ == "__main__":

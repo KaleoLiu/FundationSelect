@@ -1,0 +1,30 @@
+# Virtual environment
+.venv311/
+venv/
+.env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.cursor/
+.DS_Store
+*.log
+
+# 除錯／臨時檔（專案根目錄）
+html.log
+geckodriver
+geckodriver.log
+sitca_fast_response.html
+wq02_base.html
+
+# Excel 產出可選：若不想追蹤可取消註解
+# FundRanking_*.xlsx
